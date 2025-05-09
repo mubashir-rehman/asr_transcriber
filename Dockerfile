@@ -1,69 +1,63 @@
-# ----------- Build frontend -----------
-    FROM node:20 AS frontend-build
+# Stage 1: Build the Next.js frontend
+FROM node:18-bullseye-slim AS frontend-builder
 
-    WORKDIR /app/asr-frontend
-    COPY asr-frontend/package.json asr-frontend/package-lock.json* ./
-    RUN npm install
-    COPY asr-frontend/ ./
-    RUN npm run build
-    
-    # ----------- Build backend -----------
-    FROM python:3.11-slim AS backend-build
-    
-    ENV PYTHONDONTWRITEBYTECODE 1
-    ENV PYTHONUNBUFFERED 1
-    
-    WORKDIR /app
-    
-    # Install system dependencies (add more as needed)
-    RUN apt-get update && apt-get install -y \
-        build-essential \
-        ffmpeg \
-        libpq-dev \
-        && rm -rf /var/lib/apt/lists/*
-    
-    # Copy backend code
-    COPY backend/ ./backend/
-    COPY backend/requirements.txt ./backend/requirements.txt
-    
-    # Install Python dependencies
-    RUN pip install --upgrade pip
-    RUN pip install -r backend/requirements.txt
-    
-    # Copy frontend build to backend staticfiles (optional, if you want Django to serve frontend)
-    COPY --from=frontend-build /app/asr-frontend/.next /app/backend/static/.next
-    COPY --from=frontend-build /app/asr-frontend/public /app/backend/static/public
-    
-    # ----------- Final image -----------
-    FROM python:3.11-slim
-    
-    WORKDIR /app
-    
-    # Install system dependencies
-    RUN apt-get update && apt-get install -y \
-        ffmpeg \
-        libpq-dev \
-        && rm -rf /var/lib/apt/lists/*
-    
-    # Copy backend and installed packages
-    COPY --from=backend-build /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-    COPY --from=backend-build /app/backend /app/backend
-    COPY --from=backend-build /app/backend/requirements.txt /app/backend/requirements.txt
-    
-    # Copy frontend build (for static serving, optional)
-    COPY --from=frontend-build /app/asr-frontend/.next /app/backend/static/.next
-    COPY --from=frontend-build /app/asr-frontend/public /app/backend/static/public
-    
-    # Set environment variables
-    ENV DJANGO_SETTINGS_MODULE=backend.settings
-    ENV PYTHONUNBUFFERED=1
-    
-    # Collect static files (if needed)
-    RUN pip install --upgrade pip && pip install gunicorn
-    RUN python backend/manage.py collectstatic --noinput
-    
-    # Expose ports (8000 for Django, 3000 for Next.js if needed)
-    EXPOSE 8000
-    
-    # Start Django backend with Gunicorn
-    CMD ["gunicorn", "backend.wsgi:application", "--bind", "0.0.0.0:8000"]
+WORKDIR /app/asr-frontend
+
+# Install dependencies
+COPY asr-frontend/package.json asr-frontend/package-lock.json ./
+RUN npm ci
+
+# Copy source & build
+COPY asr-frontend/ ./
+RUN npm run build
+
+# Stage 2: Build the Python backend + bundle frontend
+FROM python:3.9-slim-bullseye
+
+# Install runtime deps: git (if you import any private git pkgs), node & npm to serve Next.js
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      libpq-dev \
+      nodejs \
+      npm \
+      git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Set env vars for Django
+ENV PYTHONUNBUFFERED=1 \
+    DJANGO_SETTINGS_MODULE=backend.settings \
+    PORT_BACKEND=8000 \
+    PORT_FRONTEND=3000
+
+WORKDIR /app
+
+#
+# 1) Install & copy the Django backend
+#
+COPY backend/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the backend
+COPY backend/ ./
+
+#
+# 2) Copy the already-built frontend assets from stage 1
+#
+#    We bring over the Next.js build output & static files
+COPY --from=frontend-builder /app/asr-frontend/.next ./asr-frontend/.next
+COPY --from=frontend-builder /app/asr-frontend/public ./asr-frontend/public
+COPY frontend-builder /app/asr-frontend/node_modules ./asr-frontend/node_modules
+COPY frontend-builder /app/asr-frontend/package.json ./asr-frontend/
+
+# Expose both ports
+EXPOSE ${PORT_BACKEND}
+EXPOSE ${PORT_FRONTEND}
+
+# Root command: launch both Gunicorn & Next.js
+# - Gunicorn serves Django on 0.0.0.0:8000
+# - Next.js serves on 0.0.0.0:3000
+CMD bash -lc "\
+  gunicorn backend.wsgi:application --bind 0.0.0.0:${PORT_BACKEND} --workers=3 & \
+  cd asr-frontend && npm run start -- -p ${PORT_FRONTEND} \
+"
